@@ -223,23 +223,66 @@ def scan_data_changes(
     return missing, outdated, deletions, download_bytes
 
 
+def download_bytes_for(root: dict, rel_paths: list[str]) -> int:
+    sizes = {
+        rel: int(node["size"])
+        for rel, node in manifest_paths(root)
+        if node.get("type") == "file"
+    }
+    return sum(sizes[rel] for rel in rel_paths if rel in sizes)
+
+
 def print_data_changes(
     missing: list[str], outdated: list[str], deletions: list[str], total: int
 ) -> None:
     if missing:
-        print("\nMissing (will download):")
+        print("\nMissing (new):")
         for p in missing:
             print(f"  + {p}")
     if outdated:
-        print("\nOutdated (will replace):")
+        print("\nOutdated:")
         for p in outdated:
             print(f"  ~ {p}")
     if deletions:
-        print("\nObsolete (will delete):")
+        print("\nObsolete (local files not in manifest):")
         for p in deletions:
             print(f"  - {p}")
     if total:
-        print(f"\nTotal download size: {format_size(total)}")
+        print(f"\nTotal download size (all changes): {format_size(total)}")
+
+
+def prompt_download_choice(
+    missing: list[str], outdated: list[str], deletions: list[str], root: dict
+) -> str:
+    new_bytes = download_bytes_for(root, missing)
+    outdated_bytes = download_bytes_for(root, outdated)
+    all_bytes = new_bytes + outdated_bytes
+
+    print("\nWhat would you like to download?")
+    print(f"  1. Download new only ({len(missing)} file(s), {format_size(new_bytes)})")
+    print(
+        f"  2. Download outdated only ({len(outdated)} file(s), "
+        f"{format_size(outdated_bytes)})"
+    )
+    print(
+        f"  3. Download all ({len(missing) + len(outdated)} file(s), "
+        f"{format_size(all_bytes)})"
+    )
+    if deletions:
+        print(f"     (also removes {len(deletions)} obsolete file(s))")
+    print("  4. Download none (cancel)")
+
+    while True:
+        choice = input("\nChoose an option [1-4]: ").strip()
+        if choice == "1":
+            return "new"
+        if choice == "2":
+            return "outdated"
+        if choice == "3":
+            return "all"
+        if choice == "4":
+            return "none"
+        print("Invalid option.")
 
 
 def apply_data_changes(
@@ -248,22 +291,34 @@ def apply_data_changes(
     missing: list[str],
     outdated: list[str],
     deletions: list[str],
+    *,
+    fetch_missing: bool = True,
+    fetch_outdated: bool = True,
+    apply_deletions: bool = True,
 ) -> None:
-    to_fetch = set(missing) | set(outdated)
+    to_fetch: set[str] = set()
+    if fetch_missing:
+        to_fetch |= set(missing)
+    if fetch_outdated:
+        to_fetch |= set(outdated)
     paths = {
         rel: node
         for rel, node in manifest_paths(root)
         if node.get("type") == "file" and rel != WOW_EXE
     }
 
-    for rel in deletions:
-        if rel == WOW_EXE:
-            continue
-        target = client / rel
-        if target.is_file():
-            target.unlink()
-        elif target.is_dir():
-            shutil.rmtree(target)
+    if apply_deletions:
+        for rel in deletions:
+            if rel == WOW_EXE:
+                continue
+            target = client / rel
+            if target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+
+    if not to_fetch:
+        return
 
     count = len(to_fetch)
     for i, rel in enumerate(sorted(to_fetch), 1):
@@ -310,11 +365,21 @@ def run_data_updater(client: Path) -> None:
 
     print_data_changes(missing, outdated, deletions, total)
 
-    if input("\nProceed? [y/N]: ").strip().lower() not in ("y", "yes"):
+    choice = prompt_download_choice(missing, outdated, deletions, root)
+    if choice == "none":
         print("Cancelled.")
         return
 
-    apply_data_changes(root, client, missing, outdated, deletions)
+    apply_data_changes(
+        root,
+        client,
+        missing,
+        outdated,
+        deletions,
+        fetch_missing=choice in ("new", "all"),
+        fetch_outdated=choice in ("outdated", "all"),
+        apply_deletions=choice == "all",
+    )
     print("Done.")
 
 
