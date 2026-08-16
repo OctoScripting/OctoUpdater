@@ -6,9 +6,11 @@ OctoWoW client updater — single-file, stdlib-only.
 from __future__ import annotations
 
 import hashlib
-import json
+import http.client
+import math
 import os
 import shutil
+import struct
 import sys
 import time
 import urllib.error
@@ -18,8 +20,8 @@ from pathlib import Path
 
 # --- Configuration (edit these) -----------------------------------------------
 
-SERVER = "https://octowow.st"
-VERSION = "latest"
+CDN = "https://dl.octowow.st/client/latest"
+TORRENT_URL = "https://dl.octowow.st/download/client.torrent"
 
 # Linux
 CLIENT_DIR = Path("/path/to/OctoWoW/")
@@ -27,9 +29,24 @@ CLIENT_DIR = Path("/path/to/OctoWoW/")
 # Windows (Uncomment CLIENT_DIR)
 # CLIENT_DIR = Path(r"C:\Path\To\OctoWoW")
 
-ALLOWED_HOST = urllib.parse.urlparse(SERVER).netloc
+ALLOWED_HOSTS = {"dl.octowow.st", "octowow.st"}
+UA = "OctoUpdater/1.2"
+DOWNLOAD_RETRY_COUNT = 10
+STALL_TIMEOUT_S = 60
 PATCHED_WOW_HASH_FILE = ".octo-updater-wow.sha1"
 WOW_EXE = "WoW.exe"
+# DXVK / launcher-owned; the torrent lists it but the official launcher skips it.
+SKIP_FILES = {os.path.normcase("d3d9.dll")}
+
+# Obsolete archives from the pre-torrent client. Matched by name AND size so
+# similarly named player files are never removed.
+LEGACY_ARCHIVES = {
+    "patch-6.mpq": 451195806,
+    "patch-7.mpq": 175256564,
+    "patch-8.mpq": 484649870,
+    "patch-9.mpq": 506808141,
+    "patch-a.mpq": 241751337,
+}
 
 # -------------------------------------------------------------------------------
 
@@ -62,97 +79,210 @@ def format_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
-def join_rel(*parts: str) -> str:
-    cleaned = [p for p in parts if p]
-    return os.path.join(*cleaned) if cleaned else ""
-
-
-def manifest_paths(node: dict, prefix: list[str] | None = None) -> list[tuple[str, dict]]:
-    if prefix is None:
-        prefix = []
-    name = node.get("name", "")
-    here = prefix + ([name] if name else [])
-    kind = node.get("type")
-
-    if kind == "file":
-        return [(join_rel(*here), node)]
-    if kind == "del":
-        return [(join_rel(*here), node)]
-    if kind == "mpq":
-        mpq_name = f"{name}.mpq"
-        mpq_path = join_rel(*prefix, mpq_name) if prefix else mpq_name
-        return [(mpq_path, {"type": "file", "name": mpq_name, "hash": node["hash"], "size": node["size"]})]
-    if kind == "dir":
-        out: list[tuple[str, dict]] = []
-        for child in node.get("files", []):
-            out.extend(manifest_paths(child, here))
-        return out
-    return []
-
-
-def wow_manifest_entry(root: dict) -> dict | None:
-    for rel, node in manifest_paths(root):
-        if rel == WOW_EXE and node.get("type") == "file":
-            return node
-    return None
-
-
-def fetch_manifest() -> dict:
-    url = f"{SERVER}/api/file/{VERSION}/manifest.json"
+def assert_allowed_url(url: str) -> None:
     host = urllib.parse.urlparse(url).netloc
-    if host != ALLOWED_HOST:
+    if host not in ALLOWED_HOSTS:
         raise SystemExit(f"Refusing request to unexpected host: {host}")
-    with urllib.request.urlopen(url, timeout=120) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data["root"]
+
+
+def open_url(
+    url: str, timeout: float, headers: dict[str, str] | None = None
+):
+    assert_allowed_url(url)
+    req_headers = {"User-Agent": UA}
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(url, headers=req_headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def cdn_url(rel_path: str) -> str:
+    posix = rel_path.replace(os.sep, "/")
+    encoded = "/".join(urllib.parse.quote(part, safe="") for part in posix.split("/"))
+    return f"{CDN}/{encoded}"
+
+
+def bdecode(data: bytes, i: int = 0) -> tuple[object, int]:
+    if i >= len(data):
+        raise ValueError("truncated bencode")
+    ch = data[i : i + 1]
+    if ch == b"i":
+        j = data.index(b"e", i + 1)
+        return int(data[i + 1 : j]), j + 1
+    if ch == b"l":
+        out: list[object] = []
+        i += 1
+        while data[i : i + 1] != b"e":
+            v, i = bdecode(data, i)
+            out.append(v)
+        return out, i + 1
+    if ch == b"d":
+        out: dict[bytes, object] = {}
+        i += 1
+        while data[i : i + 1] != b"e":
+            k, i = bdecode(data, i)
+            v, i = bdecode(data, i)
+            if not isinstance(k, bytes):
+                raise ValueError("bencode dict key must be bytes")
+            out[k] = v
+        return out, i + 1
+    if ch.isdigit():
+        colon = data.index(b":", i)
+        n = int(data[i:colon])
+        start = colon + 1
+        return data[start : start + n], start + n
+    raise ValueError(f"invalid bencode at offset {i}")
+
+
+def torrent_file_list(torrent: bytes) -> list[tuple[str, int]]:
+    meta, _ = bdecode(torrent)
+    if not isinstance(meta, dict):
+        raise ValueError("torrent root is not a dict")
+    info = meta.get(b"info")
+    if not isinstance(info, dict):
+        raise ValueError("torrent missing info dict")
+
+    files_node = info.get(b"files")
+    out: list[tuple[str, int]] = []
+    if isinstance(files_node, list):
+        for entry in files_node:
+            if not isinstance(entry, dict):
+                continue
+            path_parts = entry.get(b"path")
+            length = entry.get(b"length")
+            if not isinstance(path_parts, list) or not isinstance(length, int):
+                continue
+            parts = [p.decode("utf-8") for p in path_parts if isinstance(p, bytes)]
+            if not parts:
+                continue
+            out.append((os.path.join(*parts), length))
+        return out
+
+    name = info.get(b"name")
+    length = info.get(b"length")
+    if isinstance(name, bytes) and isinstance(length, int):
+        return [(name.decode("utf-8"), length)]
+    raise ValueError("torrent has no file list")
+
+
+def fetch_file_list() -> dict[str, int]:
+    with open_url(TORRENT_URL, timeout=120) as resp:
+        torrent = resp.read()
+    files = torrent_file_list(torrent)
+    if not files:
+        raise SystemExit("Torrent contained no files.")
+    return dict(files)
+
+
+def is_skipped(rel: str) -> bool:
+    return os.path.normcase(rel) in SKIP_FILES or os.path.normcase(
+        os.path.basename(rel)
+    ) in SKIP_FILES
+
+
+def _wait_and_retry(rel_path: str, attempt: int, error: Exception, tmp: Path) -> None:
+    if attempt >= DOWNLOAD_RETRY_COUNT:
+        print()
+        raise RuntimeError(f"Failed to download {rel_path}: {error}") from error
+    partial = tmp.stat().st_size if tmp.is_file() else 0
+    print(f"\n  Retry {attempt}/{DOWNLOAD_RETRY_COUNT} failed: {error}")
+    if partial:
+        print(f"  Resuming from {format_size(partial)}")
+    time.sleep(min(attempt, 8))
 
 
 def download_file(rel_path: str, dest: Path, expected_size: int) -> None:
-    url = f"{SERVER}/client/{VERSION}/{urllib.parse.quote(rel_path.replace(os.sep, '/'))}"
-    host = urllib.parse.urlparse(url).netloc
-    if host != ALLOWED_HOST:
-        raise SystemExit(f"Refusing download from unexpected host: {host}")
-
+    url = cdn_url(rel_path)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
 
-    done = 0
-    rate_at = time.time()
-    rate_done = 0
+    for attempt in range(1, DOWNLOAD_RETRY_COUNT + 1):
+        resume_from = tmp.stat().st_size if tmp.is_file() else 0
+        if resume_from > expected_size:
+            tmp.unlink(missing_ok=True)
+            resume_from = 0
+        if expected_size > 0 and resume_from == expected_size:
+            tmp.replace(dest)
+            print(
+                f"  {format_size(expected_size)} / {format_size(expected_size)} "
+                f"(100.0%)  done"
+            )
+            return
 
-    with urllib.request.urlopen(url, timeout=300) as resp:
-        with tmp.open("wb") as out:
-            while True:
-                chunk = resp.read(256 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
-                done += len(chunk)
+        extra_headers: dict[str, str] = {}
+        if resume_from > 0:
+            extra_headers["Range"] = f"bytes={resume_from}-"
 
-                now = time.time()
-                if now - rate_at >= 0.25:
-                    elapsed = now - rate_at
-                    speed = (done - rate_done) / elapsed if elapsed > 0 else 0
-                    rate_at = now
-                    rate_done = done
-                    pct = 100 * done / expected_size if expected_size else 0
-                    eta = (expected_size - done) / speed if speed > 0 and expected_size else 0
-                    sys.stdout.write(
-                        f"\r  {format_size(done)} / {format_size(expected_size)} "
-                        f"({pct:.1f}%)  {format_size(speed)}/s  ETA {format_duration(eta)}   "
-                    )
-                    sys.stdout.flush()
+        done = resume_from
+        rate_at = time.time()
+        rate_done = resume_from
+        try:
+            with open_url(url, timeout=STALL_TIMEOUT_S, headers=extra_headers) as resp:
+                status = getattr(resp, "status", 200)
+                if resume_from > 0 and status == 200:
+                    done = 0
+                    rate_done = 0
+                    mode = "wb"
+                else:
+                    mode = "ab" if resume_from > 0 else "wb"
 
-    if tmp.stat().st_size != expected_size:
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError(f"Size mismatch for {rel_path}")
-    tmp.replace(dest)
-    if expected_size > 0:
-        sys.stdout.write(
-            f"\r  {format_size(expected_size)} / {format_size(expected_size)} "
-            f"(100.0%)  done\n"
-        )
-        sys.stdout.flush()
+                with tmp.open(mode) as out:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+
+                        now = time.time()
+                        if now - rate_at >= 0.25:
+                            elapsed = now - rate_at
+                            speed = (done - rate_done) / elapsed if elapsed > 0 else 0
+                            rate_at = now
+                            rate_done = done
+                            pct = 100 * done / expected_size if expected_size else 0
+                            eta = (
+                                (expected_size - done) / speed
+                                if speed > 0 and expected_size
+                                else 0
+                            )
+                            sys.stdout.write(
+                                f"\r  {format_size(done)} / {format_size(expected_size)} "
+                                f"({pct:.1f}%)  {format_size(speed)}/s  ETA {format_duration(eta)}   "
+                            )
+                            sys.stdout.flush()
+
+            got = tmp.stat().st_size if tmp.is_file() else 0
+            if got != expected_size:
+                if got > expected_size:
+                    tmp.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"incomplete or size mismatch: got {got}, expected {expected_size}"
+                )
+            tmp.replace(dest)
+            if expected_size > 0:
+                sys.stdout.write(
+                    f"\r  {format_size(expected_size)} / {format_size(expected_size)} "
+                    f"(100.0%)  done\n"
+                )
+                sys.stdout.flush()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in {404, 410}:
+                tmp.unlink(missing_ok=True)
+                raise
+            if e.code == 416:
+                tmp.unlink(missing_ok=True)
+            _wait_and_retry(rel_path, attempt, e, tmp)
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.IncompleteRead,
+            http.client.RemoteDisconnected,
+            RuntimeError,
+        ) as e:
+            _wait_and_retry(rel_path, attempt, e, tmp)
 
 
 def load_patched_wow_hash(client: Path) -> str | None:
@@ -168,68 +298,163 @@ def save_patched_wow_hash(client: Path) -> None:
     )
 
 
+def build_tweaks(buf: bytearray) -> list[tuple[str, str, int | None, object]]:
+    default_fov_degrees = 90  # for 16:9 screen ratio
+    fov_radians = default_fov_degrees * (math.pi / 180.0)
+    current_flags = struct.unpack_from("<H", buf, 0x126)[0]
+    large_address_value = current_flags | 0x20
+
+    # fmt: off
+    return [
+        ("largeAddress",          "uint16", 0x126,     large_address_value),
+        ("fieldOfView",           "float",  0x4089b4,  fov_radians),
+        ("cameraDistance",        "float",  0x4089a4,  50.0),
+        ("farClip",               "float",  0x40fed8,  777.0),
+        ("frillDistance",         "float",  0x467958,  70.0),
+        ("nameplateRange",        "float",  0x40c448,  20.0),
+        ("soundInBackground",     "int8",   0x3a4869,  0x27),
+        ("alwaysAutoLoot",        "bytes",  None, [
+            (0x0c1ecf, bytes([0x75])),
+            (0x0c2b25, bytes([0x75])),
+        ]),
+        ("crossFactionResurrect", "bytes",  None, [
+            (0x006e5fb8, bytes([0x006e5fb9 & 0xff])),
+            (0x006e62a8, bytes([0x006e62a9 & 0xff])),
+        ]),
+        ("cameraSkipFix",         "bytes",  None, [
+            (0x02ccd0, bytes([
+                0x55, 0x8b, 0x05, 0x48, 0x4e, 0x88, 0x00, 0x8b, 0x0d, 0x44, 0x4e, 0x88, 0x00, 0xe9, 0x33, 0x90,
+                0x32, 0x00, 0x83, 0xc0, 0x32, 0x83, 0xc1, 0x32, 0x3b, 0x0d, 0xa8, 0xeb, 0xc4, 0x00, 0x7e, 0x03,
+                0x83, 0xe9, 0x01, 0x3b, 0x05, 0xac, 0xeb, 0xc4, 0x00, 0x7e, 0x03, 0x83, 0xe8, 0x01, 0x83, 0xe9,
+                0x32, 0x83, 0xe8, 0x32, 0x89, 0x05, 0x48, 0x4e, 0x88, 0x00, 0x89, 0x0d, 0x44, 0x4e, 0x88, 0x00,
+                0x5d, 0xeb, 0x0d,
+            ])),
+            (0x02d326, bytes([0xe9, 0xb1, 0x8a, 0x32, 0x00])),
+            (0x02d334, bytes([0x8b, 0x35, 0x48, 0x4e, 0x88, 0x00])),
+            (0x355d15, bytes([
+                0x83, 0xf8, 0x32, 0x7d, 0x03, 0x83, 0xc0, 0x01, 0x83, 0xf9, 0x32,
+                0x7d, 0x03, 0x83, 0xc1, 0x01, 0xe9, 0xb8, 0x6f, 0xcd, 0xff,
+            ])),
+            (0x355ddc, bytes([
+                0x8d, 0x4d, 0xf0, 0x51,
+                0xff, 0x35, 0x00, 0x4e, 0x88, 0x00, 0xff, 0x15, 0x50, 0xf6, 0x7f, 0x00, 0x8b, 0x45, 0xf0, 0x8b,
+                0x15, 0x44, 0x4e, 0x88, 0x00, 0xe9, 0x35, 0x75, 0xcd, 0xff,
+            ])),
+        ]),
+        ("skillUiGateHijack",     "bytes",  None, [
+            (0x002ddf90, bytes([
+                0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x53, 0x56,
+                0x57, 0x8b, 0x3d, 0x60, 0xab, 0xce, 0x00, 0x83,
+                0xff, 0xff, 0x89, 0x55, 0xfc, 0x89, 0x4d, 0xf8,
+                0x74, 0x79, 0x8b, 0x75, 0x08, 0x8b, 0x15, 0x58,
+                0xab, 0xce, 0x00, 0x8b, 0xc7, 0x23, 0xc6, 0x8d,
+                0x04, 0x40, 0x8b, 0x4c, 0x82, 0x08, 0xf6, 0xc1,
+                0x01, 0x8d, 0x44, 0x82, 0x04, 0x75, 0x04, 0x85,
+                0xc9, 0x75, 0x05, 0x33, 0xc9, 0x8d, 0x49, 0x00,
+                0xf6, 0xc1, 0x01, 0x75, 0x4e, 0x85, 0xc9, 0x74,
+                0x4a, 0x39, 0x31, 0x74, 0x13, 0x8b, 0xc7, 0x23,
+                0xc6, 0x8d, 0x04, 0x40, 0x8d, 0x04, 0x82, 0x8b,
+                0x00, 0x03, 0xc1, 0x8b, 0x48, 0x04, 0xeb, 0xe0,
+                0x8b, 0x59, 0x1c, 0x8b, 0x71, 0x18, 0x33, 0xff,
+                0x85, 0xdb, 0x7e, 0x27, 0x8d, 0x64, 0x24, 0x00,
+                0x8b, 0x4e, 0x0c, 0x8b, 0x56, 0x08, 0x6a, 0x00,
+                0x6a, 0x00, 0x51, 0x8b, 0x4d, 0xf8, 0x52, 0x8b,
+                0x55, 0xfc, 0xe8, 0xb9, 0xfd, 0xff, 0xff, 0x84,
+                0xc0, 0x75, 0x13, 0x47, 0x83, 0xc6, 0x20, 0x3b,
+                0xfb, 0x7c, 0xdd, 0x5f, 0x5e, 0x33, 0xc0, 0x5b,
+                0x8b, 0xe5, 0x5d, 0xc2, 0x04, 0x00, 0x5f, 0x8b,
+                0xc6, 0x5e, 0x5b, 0x8b, 0xe5, 0x5d, 0xc2, 0x04,
+                0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            ])),
+        ]),
+    ]
+    # fmt: on
+
+
+def _fits(buf: bytearray, offset: int, size: int) -> bool:
+    return 0 <= offset and offset + size <= len(buf)
+
+
 def patch_wow_exe(exe_path: Path, exe_bytes: bytes) -> None:
-    """Always-on launcher patches only."""
     buf = bytearray(exe_bytes)
-    buf[0x006E5FB8 : 0x006E5FB8 + 1] = bytes([0xB9])
-    buf[0x006E62A8 : 0x006E62A8 + 1] = bytes([0xA9])
-    buf[0x002DDF90 : 0x002DDF90 + 136] = bytes([
-        0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x53, 0x56, 0x57, 0x8B, 0x3D, 0x60, 0xAB, 0xCE,
-        0x00, 0x83, 0xFF, 0xFF, 0x89, 0x55, 0xFC, 0x89, 0x4D, 0xF8, 0x74, 0x79, 0x8B, 0x75,
-        0x08, 0x8B, 0x15, 0x58, 0xAB, 0xCE, 0x00, 0x8B, 0xC7, 0x23, 0xC6, 0x8D, 0x04, 0x40,
-        0x8B, 0x4C, 0x82, 0x08, 0xF6, 0xC1, 0x01, 0x8D, 0x44, 0x82, 0x04, 0x75, 0x04, 0x85,
-        0xC9, 0x75, 0x05, 0x33, 0xC9, 0x8D, 0x49, 0x00, 0xF6, 0xC1, 0x01, 0x75, 0x4E, 0x85,
-        0xC9, 0x74, 0x4A, 0x39, 0x31, 0x74, 0x13, 0x8B, 0xC7, 0x23, 0xC6, 0x8D, 0x04, 0x40,
-        0x8D, 0x04, 0x82, 0x8B, 0x00, 0x03, 0xC1, 0x8B, 0x48, 0x04, 0xEB, 0xE0, 0x8B, 0x59,
-        0x1C, 0x8B, 0x71, 0x18, 0x33, 0xFF, 0x85, 0xDB, 0x7E, 0x27, 0x8D, 0x64, 0x24, 0x00,
-        0x8B, 0x4E, 0x0C, 0x8B, 0x56, 0x08, 0x6A, 0x00, 0x6A, 0x00, 0x51, 0x8B, 0x4D, 0xF8,
-        0x52, 0x8B, 0x55, 0xFC, 0xE8, 0xB9, 0xFD, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x13, 0x47,
-        0x83, 0xC6, 0x20, 0x3B, 0xFB, 0x7C, 0xDD, 0x5F, 0x5E, 0x33, 0xC0, 0x5B, 0x8B, 0xE5,
-        0x5D, 0xC2, 0x04, 0x00, 0x5F, 0x8B, 0xC6, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x04,
-        0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-    ])
+    for label, kind, offset, value in build_tweaks(buf):
+        if kind == "float" and offset is not None:
+            if not _fits(buf, offset, 4):
+                print(f"  Skipping {label}: offset {hex(offset)} past end of WoW.exe")
+                continue
+            print(f"  Applying: {label}")
+            struct.pack_into("<f", buf, offset, float(value))
+        elif kind == "int8" and offset is not None:
+            if not _fits(buf, offset, 1):
+                print(f"  Skipping {label}: offset {hex(offset)} past end of WoW.exe")
+                continue
+            print(f"  Applying: {label}")
+            struct.pack_into("<b", buf, offset, int(value))
+        elif kind == "uint16" and offset is not None:
+            if not _fits(buf, offset, 2):
+                print(f"  Skipping {label}: offset {hex(offset)} past end of WoW.exe")
+                continue
+            print(f"  Applying: {label}")
+            struct.pack_into("<H", buf, offset, int(value))
+        elif kind == "bytes":
+            patches = value
+            assert isinstance(patches, list)
+            in_range = [
+                (off, data) for off, data in patches if _fits(buf, off, len(data))
+            ]
+            skipped = len(patches) - len(in_range)
+            if not in_range:
+                print(f"  Skipping {label}: offsets past end of WoW.exe")
+                continue
+            extra = f" ({skipped} site(s) skipped)" if skipped else ""
+            print(f"  Applying: {label}{extra}")
+            for off, data in in_range:
+                buf[off : off + len(data)] = data
+        else:
+            raise ValueError(f"Unknown tweak type: {kind}")
     exe_path.write_bytes(buf)
 
 
+def scan_legacy_archives(client: Path) -> list[str]:
+    data_dir = client / "Data"
+    if not data_dir.is_dir():
+        return []
+    found: list[str] = []
+    for name in data_dir.iterdir():
+        if not name.is_file():
+            continue
+        expected = LEGACY_ARCHIVES.get(name.name.lower())
+        if expected is None:
+            continue
+        if name.stat().st_size == expected:
+            found.append(str(Path("Data") / name.name))
+    return sorted(found)
+
+
 def scan_data_changes(
-    root: dict, client: Path
+    files: dict[str, int], client: Path
 ) -> tuple[list[str], list[str], list[str], int]:
-    """Scan manifest for game data; WoW.exe is handled separately."""
     missing: list[str] = []
     outdated: list[str] = []
-    deletions: list[str] = []
     download_bytes = 0
 
-    for rel, node in manifest_paths(root):
-        if rel == WOW_EXE:
+    for rel, size in files.items():
+        if rel == WOW_EXE or is_skipped(rel):
             continue
-
-        if node.get("type") == "del":
-            if (client / rel).exists():
-                deletions.append(rel)
-            continue
-
-        expected_hash = node["hash"]
-        size = int(node["size"])
         local = client / rel
-
         if not local.is_file():
             missing.append(rel)
             download_bytes += size
-        elif sha1_of_file(local) != expected_hash:
+        elif local.stat().st_size != size:
             outdated.append(rel)
             download_bytes += size
 
+    deletions = scan_legacy_archives(client)
     return missing, outdated, deletions, download_bytes
 
 
-def download_bytes_for(root: dict, rel_paths: list[str]) -> int:
-    sizes = {
-        rel: int(node["size"])
-        for rel, node in manifest_paths(root)
-        if node.get("type") == "file"
-    }
-    return sum(sizes[rel] for rel in rel_paths if rel in sizes)
+def download_bytes_for(files: dict[str, int], rel_paths: list[str]) -> int:
+    return sum(files[rel] for rel in rel_paths if rel in files)
 
 
 def print_data_changes(
@@ -240,11 +465,11 @@ def print_data_changes(
         for p in missing:
             print(f"  + {p}")
     if outdated:
-        print("\nOutdated:")
+        print("\nOutdated (size mismatch):")
         for p in outdated:
             print(f"  ~ {p}")
     if deletions:
-        print("\nObsolete (local files not in manifest):")
+        print("\nObsolete (legacy archives):")
         for p in deletions:
             print(f"  - {p}")
     if total:
@@ -252,10 +477,10 @@ def print_data_changes(
 
 
 def prompt_download_choice(
-    missing: list[str], outdated: list[str], deletions: list[str], root: dict
+    missing: list[str], outdated: list[str], deletions: list[str], files: dict[str, int]
 ) -> str:
-    new_bytes = download_bytes_for(root, missing)
-    outdated_bytes = download_bytes_for(root, outdated)
+    new_bytes = download_bytes_for(files, missing)
+    outdated_bytes = download_bytes_for(files, outdated)
     all_bytes = new_bytes + outdated_bytes
 
     print("\nWhat would you like to download?")
@@ -286,7 +511,7 @@ def prompt_download_choice(
 
 
 def apply_data_changes(
-    root: dict,
+    files: dict[str, int],
     client: Path,
     missing: list[str],
     outdated: list[str],
@@ -301,16 +526,9 @@ def apply_data_changes(
         to_fetch |= set(missing)
     if fetch_outdated:
         to_fetch |= set(outdated)
-    paths = {
-        rel: node
-        for rel, node in manifest_paths(root)
-        if node.get("type") == "file" and rel != WOW_EXE
-    }
 
     if apply_deletions:
         for rel in deletions:
-            if rel == WOW_EXE:
-                continue
             target = client / rel
             if target.is_file():
                 target.unlink()
@@ -322,42 +540,32 @@ def apply_data_changes(
 
     count = len(to_fetch)
     for i, rel in enumerate(sorted(to_fetch), 1):
-        node = paths[rel]
-        size = int(node["size"])
+        size = files[rel]
         print(f"[{i}/{count}] {rel}  ({format_size(size)})")
         download_file(rel, client / rel, size)
 
 
-def wow_needs_update(client: Path, manifest_entry: dict) -> str | None:
-    """Return reason WoW.exe needs work, or None if already patched and current."""
+def wow_needs_update(client: Path, expected_size: int) -> str | None:
     wow = client / WOW_EXE
     patched_hash = load_patched_wow_hash(client)
     if wow.is_file() and patched_hash and sha1_of_file(wow) == patched_hash:
         return None
     if not wow.is_file():
         return "missing"
-    return "outdated or not patched"
-
-
-def print_wow_warning() -> None:
-    print(
-        "\n"
-        "WARNING: This only downloads WoW.exe and applies required server patches\n"
-        "(cross-faction resurrect, skill UI). It does NOT enable launcher tweak options\n"
-        "such as auto-loot, FOV, camera distance, or far clip. Use the official\n"
-        "launcher if you want those features.\n"
-    )
+    if wow.stat().st_size != expected_size:
+        return "outdated"
+    return "not patched"
 
 
 def run_data_updater(client: Path) -> None:
     print("\n--- Check for updates (game data) ---\n")
     print("WoW.exe is not included. Use menu option 2 for the executable.\n")
 
-    print("Fetching manifest...")
-    root = fetch_manifest()
+    print("Fetching torrent file list...")
+    files = fetch_file_list()
 
     print("Scanning local files...")
-    missing, outdated, deletions, total = scan_data_changes(root, client)
+    missing, outdated, deletions, total = scan_data_changes(files, client)
 
     if not missing and not outdated and not deletions:
         print("Game data is up to date.")
@@ -365,13 +573,13 @@ def run_data_updater(client: Path) -> None:
 
     print_data_changes(missing, outdated, deletions, total)
 
-    choice = prompt_download_choice(missing, outdated, deletions, root)
+    choice = prompt_download_choice(missing, outdated, deletions, files)
     if choice == "none":
         print("Cancelled.")
         return
 
     apply_data_changes(
-        root,
+        files,
         client,
         missing,
         outdated,
@@ -390,33 +598,38 @@ def run_full_download(client: Path) -> None:
 
 
 def run_wow_updater(client: Path) -> None:
-    print("\n--- Download WoW.exe ---")
-    print_wow_warning()
+    print("\n--- Download WoW.exe ---\n")
 
-    print("Fetching manifest...")
-    root = fetch_manifest()
-    entry = wow_manifest_entry(root)
-    if not entry:
-        print(f"{WOW_EXE} not found in manifest.")
+    print("Fetching torrent file list...")
+    files = fetch_file_list()
+    size = files.get(WOW_EXE)
+    if size is None:
+        print(f"{WOW_EXE} not found in torrent.")
         return
 
-    reason = wow_needs_update(client, entry)
+    reason = wow_needs_update(client, size)
     if reason is None:
         print(f"{WOW_EXE} is already installed and patched.")
         return
 
-    size = int(entry["size"])
-    print(f"\nWill download {WOW_EXE} ({format_size(size)}) and apply required patches.")
+    wow = client / WOW_EXE
+    need_download = reason != "not patched"
+    action = "download and patch" if need_download else "patch"
+    print(f"\nWill {action} {WOW_EXE} ({format_size(size)}).")
+    print(
+        "Patches: large-address, FOV 90°, camera, far clip, auto-loot, "
+        "sound-in-background, camera skip, cross-faction resurrect, skill UI."
+    )
 
     if input("\nProceed? [y/N]: ").strip().lower() not in ("y", "yes"):
         print("Cancelled.")
         return
 
-    print(f"\nDownloading {WOW_EXE}...")
-    download_file(WOW_EXE, client / WOW_EXE, size)
+    if need_download:
+        print(f"\nDownloading {WOW_EXE}...")
+        download_file(WOW_EXE, wow, size)
 
     print("Patching WoW.exe...")
-    wow = client / WOW_EXE
     patch_wow_exe(wow, wow.read_bytes())
     save_patched_wow_hash(client)
     print("Done.")
@@ -433,7 +646,7 @@ def ensure_client_dir(client: Path) -> bool:
 def main() -> int:
     client = CLIENT_DIR.resolve()
     print("OctoWoW Client Updater")
-    print(f"Server: {SERVER}")
+    print(f"CDN: {CDN}")
     print(f"Client: {client}")
 
     if not ensure_client_dir(client):
@@ -457,6 +670,8 @@ def main() -> int:
             break
         else:
             print("Invalid option.")
+
+    return 0
 
 
 if __name__ == "__main__":
